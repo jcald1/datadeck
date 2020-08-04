@@ -1,7 +1,15 @@
-const fs = require('fs');
-const {serializeError } = require('serialize-error');
-const formidable = require('formidable');
-const { v4: uuidv4 } = require('uuid');
+import fs from 'fs';
+import {serializeError } from 'serialize-error';
+import formidable from 'formidable';
+import { v4 as uuidv4 } from 'uuid';
+import { runMiddleware } from './middleware';
+import timeout from 'connect-timeout'; //express v4
+import { callSosCa} from './services/sosCA';
+import path from "path";
+
+app.use(timeout(process.env.api.timeout));
+// Add all other middleware here
+app.use(haltOnTimedout);
 
 // Disable the JSON body parser so we get a stream
 export const config = {
@@ -20,11 +28,15 @@ const sendJsonResponse = (req, res, code, data) => {
 const ensureDirExists = async targetDir => fs.promises.mkdir(targetDir, { recursive: true });
 
 export default async (req, res) => {
+  // Run the middleware: https://nextjs.org/docs/api-routes/api-middlewares
+  await runMiddleware(req, res, cors)
+
   const uuid = uuidv4();
 
   const uploadDir = `/tmp/dataDeck/seedData/${uuid}`;
   await ensureDirExists(uploadDir);
 
+  let alreadyResolved = false;
   return new Promise(resolve => {
     const form = new formidable.IncomingForm({uploadDir});
     form.parse(req, async (err, fields, files) => {
@@ -33,25 +45,76 @@ export default async (req, res) => {
               const wrappedErr = {msg: 'Error reading posted file', err: serializeError(err)};
               console.error(wrappedErr);
               sendJsonResponse(req, res, 500, wrappedErr);
-              resolve();
+              alreadyResolved=true;
+              if (!alreadyResolved) {
+                resolve();
+              }
+              return;
             }
 
             console.log('Finished parsing file', {fullPath: files.file.path, originalFilename: files.file.name, uuid});
 
-            // TODO: Call SOS CA
-            //console.log('Calling SOS CA');
-            //console.log('Finished Calling SOS CA.  Returning response');
+            console.log('Calling SOS CA');
+            const sosCaResult = await callSosCa(files.file.path);
+            console.log('Finished Calling SOS CA.', sosCaResult);
 
-            await fs.promises.unlink(files.file.path);
-            const msg = {status: 'success', uuid};
-            sendJsonResponse(req, res, 200, msg);
-            resolve();
+            if (!sosCaResult.filestream) {
+              const wrappedErr = {msg: 'No sosCA Output File', err: serializeError(err)};
+              console.error(wrappedErr);
+              alreadyResolved=true;
+              sendJsonResponse(req, res, 500, wrappedErr);
+              if (!alreadyResolved) {
+                resolve();
+              }
+              return;
+            }
+
+            sosCaResult.filestream.on('error', err => {
+              const wrappedErr = {msg: 'Error reading sosCA Output File', err: serializeError(err)};
+              console.error(wrappedErr);
+              alreadyResolved=true;
+              sendJsonResponse(req, res, 500, wrappedErr);
+              if (!alreadyResolved) {
+                resolve();
+              }
+            });
+
+            if (sosCaResult.err) {
+              console.log('Partial results detected');
+              res.status(206); // Let the pipe finish the partial results
+            }
+
+            sosCaResult.filestream.pipe(res)
+                .on('error', err => {
+              const wrappedErr = {msg: 'Error Sending Returning File to Client', err: serializeError(err)};
+              console.error(wrappedErr);
+              alreadyResolved=true;
+              sendJsonResponse(req, res, 500, wrappedErr);
+              if (!alreadyResolved) {
+                resolve();
+              }
+            })
+                .on('close', async () => {
+                  console.log('Finished.');
+                  //const msg = sosCaResult. {status: 'success', uuid};
+                  //sendJsonResponse(req, res, 200, msg);
+
+                  console.log('Deleting directory', uploadDir);
+                  // await fs.promises.unlink(uploadDir);
+                  alreadyResolved = true;
+                  if (!alreadyResolved) {
+                    resolve();
+                  }
+                });
           }
           catch (err) {
             const wrappedErr = {msg: 'Unhandled error reading posted file', err: serializeError(err)};
             console.error(wrappedErr);
             sendJsonResponse(req, res, 500, wrappedErr);
-            resolve();
+            alreadyResolved=true;
+            if (!alreadyResolved) {
+              resolve();
+            }
           }
         }
     )
